@@ -1,0 +1,1196 @@
+#%%
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+# ============================================
+# LOAD AND INITIAL CLEANING
+# ============================================
+# Load dataset - UPDATE THIS PATH to your CSV location
+df = pd.read_csv('/Users/saiamarthala/Downloads/Patient_Dataset.csv')
+
+print("=" * 60)
+print("INITIAL DATA INSPECTION")
+print("=" * 60)
+print(df.head())
+print("\nData Info:")
+print(df.info())
+print("\nMissing Values:")
+print(df.isnull().sum())
+
+import numpy as np
+
+
+#%%
+# ============================================
+# HANDLING MISSING VALUES
+# ============================================
+
+missing_pct = (df.isnull().sum() / len(df)) * 100
+print("\nMissing value percentages:")
+print(missing_pct[missing_pct > 0])
+
+# Forward fill then backward fill (for time-series continuity)
+df['Heart Rate (bpm)'] = df['Heart Rate (bpm)'].ffill().bfill()
+df['Temperature (\u00b0C)'] = df['Temperature (\u00b0C)'].ffill().bfill()
+df['Blood Pressure (mmHg)'] = df['Blood Pressure (mmHg)'].ffill().bfill()
+
+print("\nMissing values handled")
+print("Remaining missing values:")
+print(df.isnull().sum())
+
+#%%
+# ============================================
+# REMOVING DUPLICATES
+# ============================================
+
+print(f"\nDuplicates found: {df.duplicated().sum()}")
+df = df.drop_duplicates()
+print(f"Duplicates removed. Rows remaining: {len(df)}")
+#%%
+# ============================================
+# REMOVING OUTLIERS
+# ============================================
+
+print("\nChecking for outliers...")
+print(f"Heart Rate < 0: {(df['Heart Rate (bpm)'] < 0).sum()}")
+print(f"Heart Rate > 250: {(df['Heart Rate (bpm)'] > 250).sum()}")
+print(f"Temperature < 30°C: {(df['Temperature (°C)'] < 30).sum()}")
+print(f"Temperature > 45°C: {(df['Temperature (°C)'] > 45).sum()}")
+
+# Remove biologically impossible values
+df = df[(df['Heart Rate (bpm)'] >= 30) & (df['Heart Rate (bpm)'] <= 250)]
+df = df[(df['Temperature (°C)'] >= 30) & (df['Temperature (°C)'] <= 45)]
+
+print(f"Outliers removed. Rows remaining: {len(df)}")
+
+#%%
+# ============================================
+# TRANSFORMING TIMESTAMP AND SORTING
+# ============================================
+
+df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+df = df.sort_values(['Patient ID', 'Timestamp']).reset_index(drop=True)
+
+# Extract time-based features
+df['Hour'] = df['Timestamp'].dt.hour
+df['DayOfWeek'] = df['Timestamp'].dt.dayofweek
+
+print("Timestamp converted and data sorted")
+
+#%%
+# ============================================
+# FEATURE SELECTION ON COLUMNS
+# ============================================
+
+features = [
+    'Patient ID',
+    'Timestamp',
+    'Heart Rate (bpm)',
+    'Temperature (°C)',
+    'Blood Pressure (mmHg)',
+    'Device ID',
+    'IP Address',
+    'Access Type',
+    'Action',
+    'Target'
+]
+
+df_model = df[features].copy()
+print(f"Selected {len(features)} columns for modeling")
+
+#%%
+# ============================================
+# PARSING BLOOD PRESSURE
+# ============================================
+
+print("\nBlood Pressure format check:")
+print(df_model['Blood Pressure (mmHg)'].head(10))
+
+# Try to convert to numeric first
+df_model['Blood Pressure (mmHg)'] = pd.to_numeric(
+    df_model['Blood Pressure (mmHg)'],
+    errors='coerce'
+)
+
+# If all NaN, it's in "120/80" format
+if df_model['Blood Pressure (mmHg)'].isna().all():
+    print("Blood Pressure is in 'systolic/diastolic' format. Splitting...")
+
+    # Reload from original df
+    df_model['Blood Pressure (mmHg)'] = df['Blood Pressure (mmHg)']
+
+    # Split into systolic and diastolic
+    bp_split = df_model['Blood Pressure (mmHg)'].str.split('/', expand=True)
+
+    df_model['BP_Systolic'] = pd.to_numeric(bp_split[0], errors='coerce')
+    df_model['BP_Diastolic'] = pd.to_numeric(bp_split[1], errors='coerce')
+
+    # Calculate Mean Arterial Pressure (MAP)
+    df_model['BP_MAP'] = (df_model['BP_Systolic'] + 2 * df_model['BP_Diastolic']) / 3
+
+    # Drop original column
+    df_model = df_model.drop(columns=['Blood Pressure (mmHg)'])
+
+    # Fill any NaNs
+    df_model['BP_Systolic'] = df_model['BP_Systolic'].ffill().bfill()
+    df_model['BP_Diastolic'] = df_model['BP_Diastolic'].ffill().bfill()
+    df_model['BP_MAP'] = df_model['BP_MAP'].ffill().bfill()
+
+    print("Blood Pressure split successfully!")
+    print(df_model[['BP_Systolic', 'BP_Diastolic', 'BP_MAP']].head())
+else:
+    print("Blood Pressure already numeric")
+    df_model['Blood Pressure (mmHg)'] = df_model['Blood Pressure (mmHg)'].ffill().bfill()
+
+#%%
+# ============================================
+# CREATING DEVICE-LEVEL FEATURES
+# ============================================
+
+print("\n" + "=" * 60)
+print("CREATING DEVICE-LEVEL FEATURES")
+
+# a) Device usage count
+device_usage = df_model.groupby('Device ID').size()
+df_model['Device_Usage_Count'] = df_model['Device ID'].map(device_usage)
+
+# Flag devices with unusually high usage
+df_model['Device_High_Usage'] = (
+    df_model['Device_Usage_Count'] > df_model['Device_Usage_Count'].quantile(0.95)
+).astype(int)
+
+print("Device usage features created")
+
+# b) Device error rate
+def device_error_rate(group):
+    """Calculate percentage of out-of-range readings per device"""
+    errors = 0
+    errors += ((group['Heart Rate (bpm)'] < 40) | (group['Heart Rate (bpm)'] > 180)).sum()
+    errors += ((group['Temperature (°C)'] < 35) | (group['Temperature (°C)'] > 40)).sum()
+    errors += ((group['BP_Systolic'] < 90) | (group['BP_Systolic'] > 180)).sum()
+    errors += ((group['BP_Diastolic'] < 60) | (group['BP_Diastolic'] > 120)).sum()
+    return errors / len(group) if len(group) > 0 else 0
+
+device_errors = df_model.groupby('Device ID').apply(device_error_rate, include_groups=False)
+df_model['Device_Error_Rate'] = df_model['Device ID'].map(device_errors)
+
+print(f"Device error rates calculated")
+print(f"  Average error rate: {df_model['Device_Error_Rate'].mean():.2%}")
+
+# c) Network features
+df_model['IP_Internal'] = df_model['IP Address'].str.startswith('192.168').astype(int)
+
+print("Network features created")
+
+# d) One-hot encode categorical variables
+if 'Access Type' in df_model.columns:
+    df_model = pd.get_dummies(df_model, columns=['Access Type'], prefix='Access')
+    print("Access Type encoded")
+
+if 'Action' in df_model.columns:
+    df_model = pd.get_dummies(df_model, columns=['Action'], prefix='Action')
+    print("Action encoded")
+
+print("Device-level features complete!")
+
+#%%
+# ============================================
+# CREATING PATIENT-LEVEL FEATURES
+# ============================================
+
+print("\n" + "=" * 60)
+print("CREATING PATIENT-LEVEL FEATURES")
+
+patient_stats = df_model.groupby('Patient ID').agg({
+    'Heart Rate (bpm)': ['mean', 'std'],
+    'Temperature (°C)': ['mean', 'std'],
+    'BP_Systolic': ['mean', 'std'],
+    'BP_Diastolic': ['mean', 'std'],
+    'BP_MAP': ['mean', 'std']
+})
+
+patient_stats.columns = [
+    'HR_mean', 'HR_std',
+    'Temp_mean', 'Temp_std',
+    'BP_Sys_mean', 'BP_Sys_std',
+    'BP_Dia_mean', 'BP_Dia_std',
+    'BP_MAP_mean', 'BP_MAP_std'
+]
+
+patient_stats = patient_stats.reset_index()
+df_model = df_model.merge(patient_stats, on='Patient ID', how='left')
+
+# Calculate deviations from patient's own baseline (z-scores)
+df_model['HR_deviation_from_baseline'] = (
+    df_model['Heart Rate (bpm)'] - df_model['HR_mean']
+) / (df_model['HR_std'] + 1e-6)
+
+df_model['Temp_deviation_from_baseline'] = (
+    df_model['Temperature (°C)'] - df_model['Temp_mean']
+) / (df_model['Temp_std'] + 1e-6)
+
+df_model['BP_Systolic_deviation_from_baseline'] = (
+    df_model['BP_Systolic'] - df_model['BP_Sys_mean']
+) / (df_model['BP_Sys_std'] + 1e-6)
+
+df_model['BP_Diastolic_deviation_from_baseline'] = (
+    df_model['BP_Diastolic'] - df_model['BP_Dia_mean']
+) / (df_model['BP_Dia_std'] + 1e-6)
+
+print("Patient baseline features created!")
+
+#%%
+# ============================================
+# CREATING TIME-SERIES FEATURES
+# ============================================
+
+print("\n" + "=" * 60)
+print("CREATING TIME-SERIES FEATURES")
+print("=" * 60)
+
+df_model = df_model.sort_values(['Patient ID', 'Device ID', 'Timestamp']).reset_index(drop=True)
+
+window_size = 5
+
+for col in ['Heart Rate (bpm)', 'Temperature (°C)', 'BP_Systolic', 'BP_Diastolic', 'BP_MAP']:
+    df_model[f'{col}_rolling_mean'] = df_model.groupby(['Patient ID', 'Device ID'])[col].transform(
+        lambda x: x.rolling(window=window_size, min_periods=1).mean()
+    )
+    df_model[f'{col}_rolling_std'] = df_model.groupby(['Patient ID', 'Device ID'])[col].transform(
+        lambda x: x.rolling(window=window_size, min_periods=1).std()
+    )
+
+print(f"Rolling statistics created (window size: {window_size})")
+
+for col in ['Heart Rate (bpm)', 'Temperature (°C)', 'BP_Systolic', 'BP_Diastolic']:
+    df_model[f'{col}_change'] = df_model.groupby(['Patient ID', 'Device ID'])[col].diff()
+
+print("Rate of change features created")
+
+df_model['Time_Since_Last_Reading'] = df_model.groupby(['Patient ID', 'Device ID'])[
+    'Timestamp'].diff().dt.total_seconds()
+
+df_model['Abnormal_Gap'] = (df_model['Time_Since_Last_Reading'] > 300).astype(int)
+
+print("Time gap features created")
+print("Time-series features complete!")
+
+#%%
+# ============================================
+# DEVICE STABILITY SCORING
+# ============================================
+
+df_model['Device_Stability_Score'] = (
+    1 - df_model['Device_Error_Rate']
+) * (
+    1 / (1 + df_model['Abnormal_Gap'])
+)
+
+print("Device stability score created!")
+
+#%%
+# ============================================
+# FINAL FEATURE SELECTION
+# ============================================
+
+print("\n" + "=" * 60)
+print("FINAL FEATURE SELECTION")
+print("=" * 60)
+
+physiological_features = [
+    'Heart Rate (bpm)',
+    'Temperature (°C)',
+    'BP_Systolic',
+    'BP_Diastolic',
+    'BP_MAP',
+]
+
+device_features = [
+    'Device_Usage_Count',
+    'Device_High_Usage',
+    'Device_Error_Rate',
+    'Device_Stability_Score',
+    'IP_Internal',
+]
+
+# Get one-hot encoded features
+access_features = [col for col in df_model.columns if col.startswith('Access_')]
+action_features = [col for col in df_model.columns if col.startswith('Action_')]
+
+# Combine all features
+all_features = physiological_features + device_features + access_features + action_features
+
+print(f"\nTotal features selected: {len(all_features)}")
+print(f"  - Physiological (raw): {len(physiological_features)}")
+print(f"  - Device-related: {len(device_features)}")
+print(f"  - Access features: {len(access_features)}")
+print(f"  - Action features: {len(action_features)}")
+
+# FIX: Include Target column when creating df_model_clean
+df_model_clean = df_model[all_features + ['Target', 'Patient ID', 'Device ID']].dropna()
+
+print(f"\nRows before dropping NaNs: {len(df_model)}")
+print(f"Rows after dropping NaNs: {len(df_model_clean)}")
+
+if len(df_model_clean) == 0:
+    raise ValueError("No data remaining! Check feature list above for NaNs.")
+
+# Verify all features exist
+print("\nChecking selected features:")
+for feature in all_features:
+    if feature not in df_model_clean.columns:
+        print(f"  MISSING: {feature}")
+    else:
+        nan_count = df_model_clean[feature].isnull().sum()
+        if nan_count > 0:
+            print(f"  WARNING - {feature}: {nan_count} NaNs")
+
+print("\nSample of final features:")
+print(df_model_clean.head())
+
+#%%
+# ============================================
+# NORMALIZING FEATURES
+# ============================================
+
+print("\n" + "=" * 60)
+print("NORMALIZING FEATURES")
+print("=" * 60)
+
+scaler = StandardScaler()
+# FIX: Only normalize the feature columns, NOT Target/Patient ID/Device ID
+df_model_clean[all_features] = scaler.fit_transform(df_model_clean[all_features])
+
+print("All features normalized (mean=0, std=1)")
+print(f"Target distribution (should be unchanged):")
+print(df_model_clean['Target'].value_counts())
+
+#%%
+# ============================================
+# TRAIN/TEST SPLIT (FIXED)
+# ============================================
+
+print("\n" + "=" * 60)
+print("TRAIN/TEST SPLIT")
+print("=" * 60)
+
+# FIX: Stratify by Target (the label), not Device ID
+train_df, test_df = train_test_split(
+    df_model_clean,
+    test_size=0.2,
+    random_state=42,
+    stratify=df_model_clean['Target']
+)
+
+X_train = train_df[all_features]
+X_test = test_df[all_features]
+y_train = train_df['Target']
+y_test = test_df['Target']
+
+# Keep metadata for later analysis
+train_patient_ids = train_df['Patient ID']
+test_patient_ids = test_df['Patient ID']
+train_device_ids = train_df['Device ID']
+test_device_ids = test_df['Device ID']
+
+print(f"Training set: {X_train.shape}")
+print(f"Test set: {X_test.shape}")
+print(f"\nTraining Target distribution:")
+print(y_train.value_counts())
+print(f"\nTest Target distribution:")
+print(y_test.value_counts())
+
+#%%
+# ============================================
+# CORRELATION HEATMAP
+# ============================================
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(12, 8))
+corr_matrix = X_train.corr()
+
+sns.heatmap(corr_matrix, annot=False, cmap='coolwarm')
+plt.title("Feature Correlation Heatmap")
+plt.tight_layout()
+plt.show()
+
+#%%
+# ============================================
+# MODEL 1: ISOLATION FOREST
+# ============================================
+
+from sklearn.ensemble import IsolationForest
+
+iso_model = IsolationForest(random_state=42, contamination='auto')
+iso_model.fit(X_train)
+iso_train_preds_raw = iso_model.predict(X_train)
+iso_train_preds = np.array([1 if p == -1 else 0 for p in iso_train_preds_raw])
+
+print(f"Isolation Forest - Training anomalies detected: {sum(iso_train_preds)}/{len(iso_train_preds)}")
+
+# Visualization
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+normal = np.array(iso_train_preds) == 0
+anomaly = np.array(iso_train_preds) == 1
+
+axes[0].scatter(X_train.iloc[:, 0], X_train.iloc[:, 1], c=iso_train_preds, cmap='coolwarm', alpha=0.5)
+axes[0].set_title("Isolation Forest - Anomaly Detection (Training)")
+axes[0].set_xlabel(X_train.columns[0])
+axes[0].set_ylabel(X_train.columns[1])
+
+axes[1].scatter(X_train.iloc[normal, 0], X_train.iloc[normal, 1], label="Normal", alpha=0.5)
+axes[1].scatter(X_train.iloc[anomaly, 0], X_train.iloc[anomaly, 1], label="Anomaly", alpha=0.5)
+axes[1].legend()
+axes[1].set_title("Isolation Forest - Normal vs Anomaly")
+
+plt.tight_layout()
+plt.show()
+
+#%%
+# ============================================
+# MODEL 2: KNN ANOMALY DETECTION
+# ============================================
+
+from sklearn.neighbors import NearestNeighbors
+
+knn = NearestNeighbors(n_neighbors=5)
+knn.fit(X_train)
+distances_train, _ = knn.kneighbors(X_train)
+knn_scores_train = distances_train.mean(axis=1)
+
+# FIX: Use a distinct variable name to avoid collision with autoencoder threshold
+knn_threshold = np.percentile(knn_scores_train, 90)
+knn_train_preds = np.array([1 if s > knn_threshold else 0 for s in knn_scores_train])
+
+print(f"KNN - Training anomalies detected: {sum(knn_train_preds)}/{len(knn_train_preds)}")
+print(f"KNN threshold: {knn_threshold:.4f}")
+
+plt.figure(figsize=(7, 5))
+plt.scatter(X_train.iloc[:, 0], X_train.iloc[:, 1], c=knn_train_preds, cmap='coolwarm', alpha=0.5)
+plt.title("KNN - Anomaly Detection (Training Data)")
+plt.xlabel(X_train.columns[0])
+plt.ylabel(X_train.columns[1])
+plt.tight_layout()
+plt.show()
+
+#%%
+# ============================================
+# MODEL 3: LOCAL OUTLIER FACTOR (LOF)
+# ============================================
+
+from sklearn.neighbors import LocalOutlierFactor
+
+# FIX: Train LOF with novelty=True so we can predict on unseen test data later
+lof_model = LocalOutlierFactor(n_neighbors=5, novelty=True)
+lof_model.fit(X_train)
+
+# For training predictions, use decision_function (novelty mode)
+lof_train_scores = lof_model.decision_function(X_train)
+lof_train_preds = np.array([1 if s < 0 else 0 for s in lof_train_scores])
+
+print(f"LOF - Training anomalies detected: {sum(lof_train_preds)}/{len(lof_train_preds)}")
+
+plt.figure(figsize=(7, 5))
+plt.scatter(X_train.iloc[:, 0], X_train.iloc[:, 1], c=lof_train_preds, cmap='coolwarm', alpha=0.5)
+plt.title("LOF - Anomaly Detection (Training Data)")
+plt.xlabel(X_train.columns[0])
+plt.ylabel(X_train.columns[1])
+plt.tight_layout()
+plt.show()
+
+#%%
+# ============================================
+# MODEL 4: AUTOENCODER
+# ============================================
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+# FIX: Train on X_train ONLY (not full dataset) to prevent data leakage
+X_train_np = X_train.values.astype(np.float32)
+train_dataset = TensorDataset(torch.from_numpy(X_train_np))
+train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+
+# Define Autoencoder
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim):
+        super(Autoencoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 16),
+            nn.ReLU(),
+            nn.Linear(16, 8),
+            nn.ReLU(),
+            nn.Linear(8, 4)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(4, 8),
+            nn.ReLU(),
+            nn.Linear(8, 16),
+            nn.ReLU(),
+            nn.Linear(16, input_dim)
+        )
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
+# Train Autoencoder
+input_dim = X_train_np.shape[1]
+ae_model = Autoencoder(input_dim)  # FIX: renamed from 'model' to 'ae_model' to avoid conflicts
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(ae_model.parameters(), lr=1e-3)
+
+epochs = 50
+for epoch in range(epochs):
+    epoch_loss = 0
+    for batch in train_dataloader:
+        data = batch[0]
+        optimizer.zero_grad()
+        output = ae_model(data)
+        loss = criterion(output, data)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+    if (epoch + 1) % 10 == 0:
+        print(f"Epoch [{epoch+1}/{epochs}] Loss: {epoch_loss/len(train_dataloader):.6f}")
+
+# Calculate reconstruction error on TRAINING data for threshold
+with torch.no_grad():
+    X_train_tensor = torch.from_numpy(X_train_np)
+    X_train_recon = ae_model(X_train_tensor).numpy()
+    recon_error_train = np.mean((X_train_np - X_train_recon)**2, axis=1)
+
+# FIX: Use distinct variable name for autoencoder threshold
+ae_threshold = recon_error_train.mean() + 3 * recon_error_train.std()
+ae_train_preds = (recon_error_train > ae_threshold).astype(int)
+
+print(f"\nAutoencoder - Training anomalies detected: {ae_train_preds.sum()}/{len(ae_train_preds)}")
+print(f"Autoencoder threshold: {ae_threshold:.6f}")
+
+#%%
+# ============================================
+# EVALUATE ALL MODELS ON TEST SET
+# ============================================
+
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    precision_score,
+    recall_score,
+    f1_score,
+    accuracy_score,
+    roc_auc_score,
+    roc_curve,
+    precision_recall_curve,
+    average_precision_score
+)
+
+print("=" * 60)
+print("TEST SET EVALUATION")
+print("=" * 60)
+
+# 1. ISOLATION FOREST - test predictions
+iso_test_preds_raw = iso_model.predict(X_test)
+iso_test_preds = np.array([1 if p == -1 else 0 for p in iso_test_preds_raw])
+# Anomaly scores for AUC (more negative = more anomalous)
+iso_test_scores = -iso_model.decision_function(X_test)
+
+# 2. KNN - test predictions (FIX: use knn_threshold, not overwritten threshold)
+distances_test, _ = knn.kneighbors(X_test)
+knn_scores_test = distances_test.mean(axis=1)
+knn_test_preds = np.array([1 if s > knn_threshold else 0 for s in knn_scores_test])
+
+# 3. LOF - test predictions (FIX: use novelty=True model, predict on unseen data)
+lof_test_scores_raw = lof_model.decision_function(X_test)
+lof_test_preds = np.array([1 if s < 0 else 0 for s in lof_test_scores_raw])
+lof_test_scores = -lof_test_scores_raw  # Higher = more anomalous
+
+# 4. AUTOENCODER - test predictions (FIX: use ae_threshold)
+X_test_np = X_test.values.astype(np.float32)
+with torch.no_grad():
+    X_test_tensor = torch.from_numpy(X_test_np)
+    X_test_recon = ae_model(X_test_tensor).numpy()
+    recon_error_test = np.mean((X_test_np - X_test_recon) ** 2, axis=1)
+
+ae_test_preds = (recon_error_test > ae_threshold).astype(int)
+
+print("All models evaluated on test set!")
+print(f"  Isolation Forest anomalies: {iso_test_preds.sum()}")
+print(f"  KNN anomalies: {knn_test_preds.sum()}")
+print(f"  LOF anomalies: {lof_test_preds.sum()}")
+print(f"  Autoencoder anomalies: {ae_test_preds.sum()}")
+
+#%%
+# ============================================
+# CALCULATE METRICS FOR ALL MODELS
+# ============================================
+
+models_preds = {
+    'Isolation Forest': iso_test_preds,
+    'KNN': knn_test_preds,
+    'LOF': lof_test_preds,
+    'Autoencoder': ae_test_preds
+}
+
+# Anomaly scores for AUC calculation (higher = more anomalous)
+models_scores = {
+    'Isolation Forest': iso_test_scores,
+    'KNN': knn_scores_test,
+    'LOF': lof_test_scores,
+    'Autoencoder': recon_error_test
+}
+
+results = []
+
+for model_name in models_preds:
+    predictions = models_preds[model_name]
+    scores = models_scores[model_name]
+
+    acc = accuracy_score(y_test, predictions)
+    precision = precision_score(y_test, predictions, zero_division=0)
+    recall = recall_score(y_test, predictions, zero_division=0)
+    f1 = f1_score(y_test, predictions, zero_division=0)
+
+    # FIX: Calculate AUC for ALL models using their continuous anomaly scores
+    try:
+        auc = roc_auc_score(y_test, scores)
+    except ValueError:
+        auc = float('nan')
+
+    try:
+        avg_prec = average_precision_score(y_test, scores)
+    except ValueError:
+        avg_prec = float('nan')
+
+    results.append({
+        'Model': model_name,
+        'Accuracy': round(acc, 4),
+        'Precision': round(precision, 4),
+        'Recall': round(recall, 4),
+        'F1-Score': round(f1, 4),
+        'AUC-ROC': round(auc, 4) if not np.isnan(auc) else 'N/A',
+        'Avg Precision': round(avg_prec, 4) if not np.isnan(avg_prec) else 'N/A'
+    })
+
+    print(f"\n{'=' * 60}")
+    print(f"{model_name} - Test Set Performance")
+    print('=' * 60)
+    print(classification_report(y_test, predictions, target_names=['Normal', 'Anomaly']))
+
+# ============================================
+# CONFUSION MATRICES
+# ============================================
+
+fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+for idx, (model_name, predictions) in enumerate(models_preds.items()):
+    cm = confusion_matrix(y_test, predictions)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[idx])
+    axes[idx].set_title(f'{model_name}')
+    axes[idx].set_ylabel('True Label')
+    axes[idx].set_xlabel('Predicted Label')
+
+plt.suptitle("Confusion Matrices - All Models", fontsize=14)
+plt.tight_layout()
+plt.show()
+
+# ============================================
+# MODEL COMPARISON TABLE
+# ============================================
+
+results_df = pd.DataFrame(results)
+print("\n" + "=" * 60)
+print("MODEL COMPARISON - TEST SET")
+print("=" * 60)
+print(results_df.to_string(index=False))
+
+# Visualize comparison
+fig, axes = plt.subplots(1, 4, figsize=(18, 4))
+
+metrics_to_plot = ['Accuracy', 'Precision', 'Recall', 'F1-Score']
+for idx, metric in enumerate(metrics_to_plot):
+    values = results_df[metric].astype(float)
+    bars = axes[idx].bar(results_df['Model'], values, color=['#2196F3', '#4CAF50', '#FF9800', '#F44336'])
+    axes[idx].set_title(f'{metric} Comparison')
+    axes[idx].set_ylabel(metric)
+    axes[idx].set_xticklabels(results_df['Model'], rotation=45, ha='right')
+    axes[idx].set_ylim(0, 1)
+    # Add value labels on bars
+    for bar, val in zip(bars, values):
+        axes[idx].text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.02,
+                      f'{val:.3f}', ha='center', va='bottom', fontsize=9)
+
+plt.suptitle("Model Performance Comparison", fontsize=14)
+plt.tight_layout()
+plt.show()
+
+# Identify best model
+best_model = results_df.loc[results_df['F1-Score'].astype(float).idxmax(), 'Model']
+print(f"\nBest model by F1-Score: {best_model}")
+
+#%%
+# ============================================
+# ROC CURVES FOR ALL MODELS
+# ============================================
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+colors = ['#2196F3', '#4CAF50', '#FF9800', '#F44336']
+
+# ROC Curve
+for idx, (model_name, scores) in enumerate(models_scores.items()):
+    try:
+        fpr, tpr, _ = roc_curve(y_test, scores)
+        auc_val = roc_auc_score(y_test, scores)
+        axes[0].plot(fpr, tpr, label=f'{model_name} (AUC={auc_val:.3f})', color=colors[idx], linewidth=2)
+    except ValueError:
+        pass
+
+axes[0].plot([0, 1], [0, 1], 'k--', linewidth=1)
+axes[0].set_xlabel('False Positive Rate')
+axes[0].set_ylabel('True Positive Rate')
+axes[0].set_title('ROC Curves - All Models')
+axes[0].legend(loc='lower right')
+axes[0].grid(True, alpha=0.3)
+
+# Precision-Recall Curve
+for idx, (model_name, scores) in enumerate(models_scores.items()):
+    try:
+        prec_vals, rec_vals, _ = precision_recall_curve(y_test, scores)
+        ap = average_precision_score(y_test, scores)
+        axes[1].plot(rec_vals, prec_vals, label=f'{model_name} (AP={ap:.3f})', color=colors[idx], linewidth=2)
+    except ValueError:
+        pass
+
+axes[1].set_xlabel('Recall')
+axes[1].set_ylabel('Precision')
+axes[1].set_title('Precision-Recall Curves - All Models')
+axes[1].legend(loc='upper right')
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+#%%
+# ============================================
+# SHAP EXPLANATIONS - ALL MODELS
+# ============================================
+
+import shap
+import warnings
+
+# Use kmeans for a compact, representative background (reduces numerical instability)
+background = shap.kmeans(X_train, 50)
+n_explain = min(50, len(X_test))  # Explain first 50 test samples
+
+# Select samples to explain (mix of anomalies and normal)
+explain_samples = X_test.iloc[:n_explain]
+
+print("Computing SHAP values for all models...")
+print("(This may take a few minutes)")
+
+# ---- ISOLATION FOREST SHAP ----
+print("\n1. Isolation Forest SHAP...")
+
+def iso_forest_score(X):
+    """Higher score = more anomalous"""
+    if not isinstance(X, pd.DataFrame):
+        X = pd.DataFrame(X, columns=all_features)
+    return -iso_model.decision_function(X)
+
+explainer_iso = shap.KernelExplainer(iso_forest_score, background)
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    shap_values_iso = explainer_iso.shap_values(explain_samples, l1_reg="num_features(10)")
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+plt.sca(axes[0])
+shap.summary_plot(shap_values_iso, explain_samples, feature_names=all_features, show=False)
+axes[0].set_title("SHAP - Isolation Forest (Beeswarm)")
+
+plt.sca(axes[1])
+shap.summary_plot(shap_values_iso, explain_samples, feature_names=all_features, plot_type="bar", show=False)
+axes[1].set_title("SHAP - Isolation Forest (Bar)")
+
+plt.tight_layout()
+plt.show()
+
+# ---- LOF SHAP ----
+print("\n2. LOF SHAP...")
+
+def lof_score(X):
+    """Higher score = more anomalous"""
+    if not isinstance(X, pd.DataFrame):
+        X = pd.DataFrame(X, columns=all_features)
+    return -lof_model.decision_function(X)
+
+explainer_lof = shap.KernelExplainer(lof_score, background)
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    shap_values_lof = explainer_lof.shap_values(explain_samples, l1_reg="num_features(10)")
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+plt.sca(axes[0])
+shap.summary_plot(shap_values_lof, explain_samples, feature_names=all_features, show=False)
+axes[0].set_title("SHAP - LOF (Beeswarm)")
+
+plt.sca(axes[1])
+shap.summary_plot(shap_values_lof, explain_samples, feature_names=all_features, plot_type="bar", show=False)
+axes[1].set_title("SHAP - LOF (Bar)")
+
+plt.tight_layout()
+plt.show()
+
+# ---- AUTOENCODER SHAP ----
+print("\n3. Autoencoder SHAP...")
+
+# Convert background to numpy for Autoencoder (needs raw arrays)
+background_np = background.data
+
+def autoencoder_error_fn(input_array):
+    """Reconstruction error - higher = more anomalous"""
+    input_tensor = torch.from_numpy(input_array.astype(np.float32))
+    with torch.no_grad():
+        recon = ae_model(input_tensor).numpy()
+    return np.mean((input_array - recon)**2, axis=1)
+
+explainer_ae = shap.KernelExplainer(autoencoder_error_fn, background_np)
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    shap_values_ae = explainer_ae.shap_values(explain_samples.values, l1_reg="num_features(10)")
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+plt.sca(axes[0])
+shap.summary_plot(shap_values_ae, explain_samples.values, feature_names=all_features, show=False)
+axes[0].set_title("SHAP - Autoencoder (Beeswarm)")
+
+plt.sca(axes[1])
+shap.summary_plot(shap_values_ae, explain_samples.values, feature_names=all_features, plot_type="bar", show=False)
+axes[1].set_title("SHAP - Autoencoder (Bar)")
+
+plt.tight_layout()
+plt.show()
+
+print("\nSHAP analysis complete for all 3 models!")
+
+#%%
+# ============================================
+# LIME EXPLANATIONS - ALL MODELS
+# ============================================
+
+import lime
+import lime.lime_tabular
+
+print("=" * 60)
+print("LIME EXPLANATIONS")
+print("=" * 60)
+
+# Create LIME explainer
+lime_explainer = lime.lime_tabular.LimeTabularExplainer(
+    training_data=X_train.values,
+    feature_names=all_features,
+    class_names=['Normal', 'Anomaly'],
+    mode='classification',
+    random_state=42
+)
+
+# ---- Helper functions to wrap each model for LIME ----
+
+def iso_forest_predict_proba_lime(X):
+    """Return [P(normal), P(anomaly)] for Isolation Forest"""
+    if not isinstance(X, pd.DataFrame):
+        X = pd.DataFrame(X, columns=all_features)
+    scores = iso_model.decision_function(X)
+    probs_anomaly = 1 / (1 + np.exp(scores * 5))  # sigmoid transformation
+    probs_normal = 1 - probs_anomaly
+    return np.column_stack([probs_normal, probs_anomaly])
+
+def knn_predict_proba_lime(X):
+    """Return [P(normal), P(anomaly)] for KNN"""
+    if isinstance(X, pd.DataFrame):
+        X_vals = X.values
+    else:
+        X_vals = X
+    distances, _ = knn.kneighbors(X_vals)
+    scores = distances.mean(axis=1)
+    probs_anomaly = (scores - scores.min()) / (scores.max() - scores.min() + 1e-10)
+    probs_normal = 1 - probs_anomaly
+    return np.column_stack([probs_normal, probs_anomaly])
+
+def lof_predict_proba_lime(X):
+    """Return [P(normal), P(anomaly)] for LOF"""
+    if not isinstance(X, pd.DataFrame):
+        X = pd.DataFrame(X, columns=all_features)
+    scores = lof_model.decision_function(X)
+    probs_anomaly = 1 / (1 + np.exp(scores * 5))
+    probs_normal = 1 - probs_anomaly
+    return np.column_stack([probs_normal, probs_anomaly])
+
+def ae_predict_proba_lime(X):
+    """Return [P(normal), P(anomaly)] for Autoencoder"""
+    if isinstance(X, pd.DataFrame):
+        X = X.values
+    input_tensor = torch.from_numpy(X.astype(np.float32))
+    with torch.no_grad():
+        recon = ae_model(input_tensor).numpy()
+    errors = np.mean((X - recon)**2, axis=1)
+    probs_anomaly = 1 / (1 + np.exp(-(errors - ae_threshold) * 10))
+    probs_normal = 1 - probs_anomaly
+    return np.column_stack([probs_normal, probs_anomaly])
+
+# ---- Generate LIME explanations for sample anomalies ----
+
+lime_models = {
+    'Isolation Forest': iso_forest_predict_proba_lime,
+    'KNN': knn_predict_proba_lime,
+    'LOF': lof_predict_proba_lime,
+    'Autoencoder': ae_predict_proba_lime
+}
+
+# Find test anomaly indices from each model
+lime_sample_indices = {
+    'Isolation Forest': np.where(iso_test_preds == 1)[0],
+    'KNN': np.where(knn_test_preds == 1)[0],
+    'LOF': np.where(lof_test_preds == 1)[0],
+    'Autoencoder': np.where(ae_test_preds == 1)[0]
+}
+
+for model_name, predict_fn in lime_models.items():
+    print(f"\n{'=' * 60}")
+    print(f"LIME Explanations - {model_name}")
+    print('=' * 60)
+
+    # Get anomaly indices for this model
+    anom_indices = lime_sample_indices[model_name]
+
+    if len(anom_indices) == 0:
+        print(f"  No anomalies detected by {model_name}, using first test samples instead")
+        anom_indices = np.arange(min(3, len(X_test)))
+
+    # Explain up to 3 anomalies
+    n_to_explain = min(3, len(anom_indices))
+
+    fig, axes = plt.subplots(1, n_to_explain, figsize=(6 * n_to_explain, 5))
+    if n_to_explain == 1:
+        axes = [axes]
+
+    for i in range(n_to_explain):
+        idx = anom_indices[i]
+        instance = X_test.iloc[idx].values
+
+        explanation = lime_explainer.explain_instance(
+            instance,
+            predict_fn,
+            num_features=10,
+            num_samples=500
+        )
+
+        # Plot as bar chart
+        feature_importance = explanation.as_list()
+        features_lime = [f[0] for f in feature_importance]
+        weights = [f[1] for f in feature_importance]
+
+        colors_lime = ['#F44336' if w > 0 else '#2196F3' for w in weights]
+        axes[i].barh(features_lime, weights, color=colors_lime)
+        axes[i].set_title(f'{model_name}\nSample {idx}')
+        axes[i].set_xlabel('Feature Weight')
+
+    plt.suptitle(f"LIME Explanations - {model_name}", fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+print("\nLIME analysis complete for all 4 models!")
+
+#%%
+# ============================================
+# DEVICE vs PATIENT FEATURE ANALYSIS
+# ============================================
+
+print("=" * 60)
+print("DEVICE vs PATIENT FEATURE IMPORTANCE ANALYSIS")
+print("=" * 60)
+
+# Categorize features
+feature_categories = {}
+for f in all_features:
+    if f in physiological_features:
+        feature_categories[f] = 'Patient/Physiological'
+    elif f in device_features:
+        feature_categories[f] = 'Device'
+    elif f in access_features:
+        feature_categories[f] = 'Network/Access'
+    elif f in action_features:
+        feature_categories[f] = 'Network/Action'
+
+print("\nFeature Categories:")
+for cat in ['Patient/Physiological', 'Device', 'Network/Access', 'Network/Action']:
+    cat_features = [f for f, c in feature_categories.items() if c == cat]
+    print(f"  {cat}: {len(cat_features)} features - {cat_features}")
+
+# ============================================
+# SHAP-based Device vs Patient Importance
+# ============================================
+
+shap_data = {
+    'Isolation Forest': shap_values_iso,
+    'LOF': shap_values_lof,
+    'Autoencoder': shap_values_ae
+}
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+for idx, (model_name, sv) in enumerate(shap_data.items()):
+    mean_abs_shap = np.abs(sv).mean(axis=0)
+
+    category_importance = {}
+    for i, feature in enumerate(all_features):
+        cat = feature_categories[feature]
+        if cat not in category_importance:
+            category_importance[cat] = 0
+        category_importance[cat] += mean_abs_shap[i]
+
+    total = sum(category_importance.values())
+    if total > 0:
+        category_pct = {k: v / total * 100 for k, v in category_importance.items()}
+    else:
+        category_pct = {k: 0 for k in category_importance}
+
+    cats = list(category_pct.keys())
+    pcts = list(category_pct.values())
+
+    colors_cat = ['#2196F3', '#F44336', '#4CAF50', '#FF9800']
+    bars = axes[idx].bar(cats, pcts, color=colors_cat[:len(cats)])
+    axes[idx].set_title(f'{model_name}')
+    axes[idx].set_ylabel('Importance (%)')
+    axes[idx].set_xticklabels(cats, rotation=45, ha='right', fontsize=9)
+    axes[idx].set_ylim(0, 100)
+
+    for bar, pct in zip(bars, pcts):
+        axes[idx].text(bar.get_x() + bar.get_width()/2., bar.get_height() + 1,
+                      f'{pct:.1f}%', ha='center', va='bottom', fontsize=10)
+
+plt.suptitle("Feature Category Importance (SHAP) - Device vs Patient", fontsize=14)
+plt.tight_layout()
+plt.show()
+
+# ============================================
+# Per-model top features breakdown
+# ============================================
+
+print("\n" + "=" * 60)
+print("TOP 10 FEATURES PER MODEL (with category)")
+print("=" * 60)
+
+for model_name, sv in shap_data.items():
+    mean_abs_shap = np.abs(sv).mean(axis=0)
+    feature_ranking = sorted(zip(all_features, mean_abs_shap), key=lambda x: x[1], reverse=True)
+
+    print(f"\n--- {model_name} ---")
+    for rank, (feat, importance) in enumerate(feature_ranking[:10], 1):
+        cat = feature_categories[feat]
+        print(f"  {rank}. {feat} ({cat}): {importance:.4f}")
+
+# ============================================
+# Summary: Device vs Patient contribution
+# ============================================
+
+print("\n" + "=" * 60)
+print("SUMMARY: DEVICE vs PATIENT FEATURE CONTRIBUTION")
+print("=" * 60)
+
+summary_data = []
+for model_name, sv in shap_data.items():
+    mean_abs_shap = np.abs(sv).mean(axis=0)
+
+    patient_importance = sum(mean_abs_shap[i] for i, f in enumerate(all_features)
+                           if feature_categories[f] == 'Patient/Physiological')
+    device_importance = sum(mean_abs_shap[i] for i, f in enumerate(all_features)
+                          if feature_categories[f] == 'Device')
+    network_importance = sum(mean_abs_shap[i] for i, f in enumerate(all_features)
+                           if feature_categories[f] in ['Network/Access', 'Network/Action'])
+
+    total = patient_importance + device_importance + network_importance
+    if total > 0:
+        summary_data.append({
+            'Model': model_name,
+            'Patient/Physiological (%)': round(patient_importance / total * 100, 1),
+            'Device (%)': round(device_importance / total * 100, 1),
+            'Network (%)': round(network_importance / total * 100, 1)
+        })
+
+summary_df = pd.DataFrame(summary_data)
+print(summary_df.to_string(index=False))
+
+# ============================================
+# Grouped bar chart: Device vs Patient per model
+# ============================================
+
+fig, ax = plt.subplots(figsize=(10, 6))
+x = np.arange(len(summary_df))
+width = 0.25
+
+bars1 = ax.bar(x - width, summary_df['Patient/Physiological (%)'], width, label='Patient/Physiological', color='#2196F3')
+bars2 = ax.bar(x, summary_df['Device (%)'], width, label='Device', color='#F44336')
+bars3 = ax.bar(x + width, summary_df['Network (%)'], width, label='Network', color='#4CAF50')
+
+ax.set_xlabel('Model')
+ax.set_ylabel('Feature Importance (%)')
+ax.set_title('Device vs Patient Feature Importance Across Models')
+ax.set_xticks(x)
+ax.set_xticklabels(summary_df['Model'])
+ax.legend()
+ax.set_ylim(0, 100)
+
+plt.tight_layout()
+plt.show()
+
+print("\nDevice vs Patient analysis complete!")
+
+#%%
+# ============================================
+# FINAL DISSERTATION SUMMARY
+# ============================================
+
+print("=" * 60)
+print("DISSERTATION ANALYSIS - COMPLETE SUMMARY")
+print("=" * 60)
+
+print("\n1. MODELS TRAINED AND EVALUATED:")
+print("   - Isolation Forest")
+print("   - KNN-based Anomaly Detection")
+print("   - Local Outlier Factor (LOF)")
+print("   - Autoencoder (PyTorch)")
+
+print("\n2. EVALUATION METRICS (Test Set):")
+print(results_df.to_string(index=False))
+
+print("\n3. XAI METHODS APPLIED:")
+print("   a) SHAP (SHapley Additive exPlanations)")
+print("      - Applied to: Isolation Forest, LOF, Autoencoder")
+print("      - Provides global and local feature importance")
+print("   b) LIME (Local Interpretable Model-agnostic Explanations)")
+print("      - Applied to: All 4 models")
+print("      - Provides local, instance-level explanations")
+
+print("\n4. DEVICE vs PATIENT ANALYSIS:")
+print("   - Feature importance broken down by category:")
+print("     * Patient/Physiological features")
+print("     * Device features")
+print("     * Network/Access features")
+print("   - Compared across all models using SHAP values")
+
+print("\n5. KEY FINDINGS:")
+best_f1_model = results_df.loc[results_df['F1-Score'].astype(float).idxmax()]
+print(f"   - Best model by F1-Score: {best_f1_model['Model']} ({best_f1_model['F1-Score']})")
+best_auc_vals = results_df[results_df['AUC-ROC'] != 'N/A']
+if len(best_auc_vals) > 0:
+    best_auc_model = best_auc_vals.loc[best_auc_vals['AUC-ROC'].astype(float).idxmax()]
+    print(f"   - Best model by AUC-ROC: {best_auc_model['Model']} ({best_auc_model['AUC-ROC']})")
+
+print("\nAll dissertation requirements completed!")
